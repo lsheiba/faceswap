@@ -2,8 +2,8 @@ import dlib
 import face_recognition
 import face_recognition_models
 
-def detect_faces(frame):
-    face_locations = face_recognition.face_locations(frame)
+def detect_faces(frame, model="hog"):
+    face_locations = face_recognition.face_locations(frame, model=model)
     landmarks = _raw_face_landmarks(frame, face_locations)
 
     for ((y, right, bottom, x), landmarks) in zip(face_locations, landmarks):
@@ -22,13 +22,17 @@ def _css_to_rect(css):
 # end of Copy/Paste
 
 class DetectedFace(object):
-    def __init__(self, image, x, w, y, h, landmarks):
+    def __init__(self, image=None, x=None, w=None, y=None, h=None, landmarks=None, landmarksXY=None):
         self.image = image
         self.x = x
         self.w = w
         self.y = y
         self.h = h
         self.landmarks = landmarks
-    
+        self.landmarksXY = landmarksXY
+
     def landmarksAsXY(self):
-        return [(p.x, p.y) for p in self.landmarks.parts()]
+        if self.landmarksXY:
+            return self.landmarksXY
+        self.landmarksXY = [(p.x, p.y) for p in self.landmarks.parts()]
+        return self.landmarksXY

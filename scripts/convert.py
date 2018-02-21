@@ -1,9 +1,12 @@
 import cv2
 import re
+import os
+
 from pathlib import Path
+from tqdm import tqdm
+
 from lib.cli import DirectoryProcessor, FullPaths
-from lib.utils import BackgroundGenerator
-from lib.faces_detect import detect_faces
+from lib.utils import BackgroundGenerator, get_folder
 
 from plugins.PluginLoader import PluginLoader
 
@@ -26,6 +29,12 @@ class ConvertImage(DirectoryProcessor):
                             help="Model directory. A directory containing the trained model \
                     you wish to process. Defaults to 'models'")
 
+        parser.add_argument('-t', '--trainer',
+                            type=str,
+                            choices=("Original", "LowMem", "GAN"), # case sensitive because this is used to load a plug-in.
+                            default="Original",
+                            help="Select the trainer that was used to create the model.")
+
         parser.add_argument('-s', '--swap-model',
                             action="store_true",
                             dest="swap_model",
@@ -34,28 +43,42 @@ class ConvertImage(DirectoryProcessor):
 
         parser.add_argument('-c', '--converter',
                             type=str,
-                            choices=("Masked", "Adjust"), # case sensitive because this is used to load a plugin.
+                            choices=("Masked", "Adjust", "GAN"), # case sensitive because this is used to load a plugin.
                             default="Masked",
                             help="Converter to use.")
+
+        parser.add_argument('-D', '--detector',
+                            type=str,
+                            choices=("hog", "cnn"), # case sensitive because this is used to load a plugin.
+                            default="hog",
+                            help="Detector to use. 'cnn' detects much more angles but will be much more resource intensive and may fail on large files.")
 
         parser.add_argument('-fr', '--frame-ranges',
                             nargs="+",
                             type=str,
-                            help="""frame ranges to apply transfer to. eg for frames 10 to 50 and 90 to 100 use --frame-ranges 10-50 90-100.
-                            Files must have the framenumber as the last number in the name!"""
+                            help="frame ranges to apply transfer to e.g. For frames 10 to 50 and 90 to 100 use --frame-ranges 10-50 90-100. \
+                            Files must have the frame-number as the last number in the name!"
                             )
 
         parser.add_argument('-d', '--discard-frames',
                             action="store_true",
                             dest="discard_frames",
                             default=False,
-                            help="when use with --frame-ranges discards frames that are not processed instead of writing them out unchanged."
+                            help="When used with --frame-ranges discards frames that are not processed instead of writing them out unchanged."
+                            )
+
+        parser.add_argument('-f', '--filter',
+                            type=str,
+                            dest="filter",
+                            default="filter.jpg",
+                            help="Reference image for the person you want to process. Should be a front portrait"
                             )
 
         parser.add_argument('-b', '--blur-size',
                             type=int,
                             default=2,
                             help="Blur size. (Masked converter only)")
+
 
         parser.add_argument('-S', '--seamless',
                             action="store_true",
@@ -87,16 +110,21 @@ class ConvertImage(DirectoryProcessor):
                             dest="avg_color_adjust",
                             default=True,
                             help="Average color adjust. (Adjust converter only)")
-
         return parser
-    
+
     def process(self):
-        # Original model goes with Adjust or Masked converter
-        # does the LowMem one work with only one?
-        model_name = "Original" # TODO Pass as argument
+        # Original & LowMem models go with Adjust or Masked converter
+        # GAN converter & model must go together
+        # Note: GAN prediction outputs a mask + an image, while other predicts only an image
+        model_name = self.arguments.trainer
         conv_name = self.arguments.converter
-        
-        model = PluginLoader.get_model(model_name)(self.arguments.model_dir)
+
+        if conv_name.startswith("GAN"):
+            assert model_name.startswith("GAN") is True, "GAN converter can only be used with GAN model!"
+        else:
+            assert model_name.startswith("GAN") is False, "GAN model can only be used with GAN converter!"
+
+        model = PluginLoader.get_model(model_name)(get_folder(self.arguments.model_dir))
         if not model.load(self.arguments.swap_model):
             print('Model Not Found! A valid model must be provided to continue!')
             exit(1)
@@ -114,11 +142,13 @@ class ConvertImage(DirectoryProcessor):
 
         # frame ranges stuff...
         self.frame_ranges = None
+
         # split out the frame ranges and parse out "min" and "max" values
         minmax = {
             "min": 0, # never any frames less than 0
             "max": float("inf")
         }
+
         if self.arguments.frame_ranges:
             self.frame_ranges = [tuple(map(lambda q: minmax[q] if q in minmax.keys() else int(q), v.split("-"))) for v in self.arguments.frame_ranges]
 
@@ -127,34 +157,43 @@ class ConvertImage(DirectoryProcessor):
 
         for item in batch.iterator():
             self.convert(converter, item)
-    
-    def check_skip(self, filename):
+
+    def check_skipframe(self, filename):
         try:
             idx = int(self.imageidxre.findall(filename)[0])
             return not any(map(lambda b: b[0]<=idx<=b[1], self.frame_ranges))
         except:
             return False
 
-
     def convert(self, converter, item):
         try:
             (filename, image, faces) = item
-            
-            skip = self.check_skip(filename)
+
+            skip = self.check_skipframe(filename)
+            if self.arguments.discard_frames and skip:
+                return
 
             if not skip: # process as normal
                 for idx, face in faces:
                     image = converter.patch_image(image, face)
 
-            output_file = self.output_dir / Path(filename).name
-
-            if self.arguments.discard_frames and skip:
-                return
+            output_file = get_folder(self.output_dir) / Path(filename).name
             cv2.imwrite(str(output_file), image)
         except Exception as e:
             print('Failed to convert image: {}. Reason: {}'.format(filename, e))
 
     def prepare_images(self):
-        for filename in self.read_directory():
+        self.read_alignments()
+        is_have_alignments = self.have_alignments()
+        for filename in tqdm(self.read_directory()):
             image = cv2.imread(filename)
-            yield filename, image, self.get_faces(image)
+
+            if is_have_alignments:
+                if self.have_face(filename):
+                    faces = self.get_faces_alignments(filename, image)
+                else:
+                    print ('no alignment found for {}, skipping'.format(os.path.basename(filename)))
+                    continue
+            else:
+                faces = self.get_faces(image)
+            yield filename, image, faces
